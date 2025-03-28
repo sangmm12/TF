@@ -1,0 +1,215 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import classification_report, roc_auc_score
+import xgboost as xgb
+from joblib import dump
+import os
+import pickle
+import multiprocessing
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # 只使用第一个 GPU
+
+# Set display option to show all columns
+pd.set_option('display.max_columns', 15)
+
+data_model = 'model_2'
+version = 'M36'#'H47'
+hm = 'mouse'#'human'
+dim = 1368#1368 for model 1/2 #2736 for model 3/4/5/6
+mer = '4mer'
+#not used in this code X_start = 5 #3 for model 1/2 5 for model 3/4/5/6
+
+df = pd.read_csv(f'{hm}/TF_{hm}_{version}_{data_model}_NV_{dim}.csv')
+print(df.head())
+print(df.shape)
+print(df.columns)
+
+# Handle data imbalance by taking equal number of samples from both classes
+#print("Handling data imbalance...")
+class_0 = df[df['Interaction'] == True]
+class_1 = df[df['Interaction'] == False]
+
+min_class_size = min(len(class_0), len(class_1))
+class_0_sample = class_0.sample(min_class_size, random_state=42)
+class_1_sample = class_1.sample(min_class_size, random_state=42)
+
+balanced_df = pd.concat([class_0_sample, class_1_sample]).sample(frac=1, random_state=42)
+print("Balanced dataset shape:", balanced_df.shape)
+
+# Separate features and target after balancing
+#X_balanced = balanced_df.iloc[:, X_start:]
+#y_balanced = balanced_df['Interaction']
+
+X_ = balanced_df.drop(columns=["GeneName", "Interaction", "Seq"]).values # Features for model 1/2
+#X_ = balanced_df.drop(columns=["GeneName_1", "GeneName_2", "Interaction", "Seq_1", "Seq_2"]).values # Features for model 3/4/5/6
+print(X_.shape)
+# for model 1/2
+#X_balanced = np.concatenate([X_[:, 0:24]], axis=1) # 2-mer
+#X_balanced = np.concatenate([X_[:, 0:88]], axis=1) # 3-mer
+X_balanced = np.concatenate([X_[:, 0:344]], axis=1) # 4-mer
+#X_balanced = np.concatenate([X_[:, 0:1368]], axis=1) # 5-mer
+
+# for model 3/4/5/6
+#X_balanced = np.concatenate([X_[:, 0:24], X_[:, 1368:1368+24]], axis=1) # 2-mer
+#X_balanced = np.concatenate([X_[:, 0:88], X_[:, 1368:1368+88]], axis=1) # 3-mer
+#X_balanced = np.concatenate([X_[:, 0:344], X_[:, 1368:1368+344]], axis=1) # 4-mer
+#X_balanced = np.concatenate([X_[:, 0:1368], X_[:, 1368:1368+1368]], axis=1) # 5-mer
+
+y_balanced = balanced_df["Interaction"].values  # Target
+print(X_balanced.shape)
+
+# Train-test split (90% train, 9% validation, 1% test)
+#print("Splitting data into train, validation, and test sets...")
+#X_train, X_temp, y_train, y_temp = train_test_split(X_balanced, y_balanced, test_size=0.1, random_state=42, stratify=y_balanced)
+#X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.1, random_state=42, stratify=y_temp)
+X_train, X_temp, y_train, y_temp = train_test_split(X_balanced, y_balanced, test_size=0.1, stratify=y_balanced)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.1, stratify=y_temp)
+print("Train set shape:", X_train.shape)
+print("Validation set shape:", X_val.shape)
+print("Test set shape:", X_test.shape)
+
+
+# Print the maximum CPU core threshold
+max_cores = multiprocessing.cpu_count()
+print(f"Maximum CPU cores available: {max_cores}")
+
+# Restrict to using 1/4 of the cores
+restricted_cores = max(1, max_cores // 4)
+print(f"Restricting to use {restricted_cores} CPU cores for training.")
+
+
+
+# Random Forest Classifier Hyperparameter Tuning
+print("==========Starting hyperparameter tuning for Random Forest Classifier==========")
+rf_model = RandomForestClassifier(random_state=42)
+
+rf_param_grid = {
+    'n_estimators': [500, 1000, 1200, 1400, 1600, 1800, 2000],
+    'max_depth': [20, 50, 100],
+    'min_samples_split': [10, 20],
+    'min_samples_leaf': [2, 4, 6, 8]
+}
+
+#rf_grid_search = GridSearchCV(estimator=rf_model, param_grid=rf_param_grid, cv=3, scoring='roc_auc', n_jobs=-1, verbose=2)
+rf_grid_search = GridSearchCV(
+    estimator=rf_model,
+    param_grid=rf_param_grid,
+    cv=3,
+    scoring='roc_auc',
+    n_jobs=restricted_cores,  # Restrict to 1/4 of the cores
+    verbose=2
+)
+
+
+rf_grid_search.fit(X_train, y_train)
+print("Random Forest hyperparameter tuning completed.")
+best_rf_model = rf_grid_search.best_estimator_
+print("Best Random Forest parameters found:", rf_grid_search.best_params_)
+dump(best_rf_model, f'best_models/best_rf_{hm}_{version}_{data_model}_{mer}.pkl')
+
+# Output Random Forest Grid Search Results
+results = rf_grid_search.cv_results_
+for mean_score, params in zip(results['mean_test_score'], results['params']):
+    print(f"ROC AUC Score: {mean_score:.4f}, Parameters: {params}")
+
+# Gradient Boosting Classifier Hyperparameter Tuning
+print("==========Starting hyperparameter tuning for Gradient Boosting Classifier==========")
+gb_model = GradientBoostingClassifier(random_state=42)
+gb_param_grid = {
+    'n_estimators': [50, 100, 150, 200],
+    'learning_rate': [0.1, 0.15],
+    'max_depth': [5, 10]
+}
+
+#gb_grid_search = GridSearchCV(estimator=gb_model, param_grid=gb_param_grid, cv=3, scoring='roc_auc', n_jobs=-1, verbose=2)
+gb_grid_search = GridSearchCV(
+    estimator=gb_model,
+    param_grid=gb_param_grid,
+    cv=3,
+    scoring='roc_auc',
+    n_jobs=restricted_cores,  # Restrict to 1/4 of the cores
+    verbose=2
+)
+
+
+
+gb_grid_search.fit(X_train, y_train)
+print("Gradient Boosting hyperparameter tuning completed.")
+best_gb_model = gb_grid_search.best_estimator_
+print("Best Gradient Boosting parameters found:", gb_grid_search.best_params_)
+dump(best_gb_model, f'best_models/best_gb_{hm}_{version}_{data_model}_{mer}.pkl')
+
+# Output Gradient Boosting Grid Search Results
+results = gb_grid_search.cv_results_
+for mean_score, params in zip(results['mean_test_score'], results['params']):
+    print(f"ROC AUC Score: {mean_score:.4f}, Parameters: {params}")
+
+
+# Hyperparameter Tuning for XGBoost
+print("==========Starting hyperparameter tuning for XGBoost==========")
+
+# XGBoost Classifier with GPU support
+print("Training XGBoost Classifier with GPU support")
+xgb_model = xgb.XGBClassifier(eval_metric='mlogloss', random_state=42, tree_method='hist', device='cuda')
+try:
+    xgb_model.fit(X_train, y_train)
+    print("XGBoost training completed.")
+except xgb.core.XGBoostError as e:
+    print("XGBoost training failed. Error:", e)
+    print("Falling back to CPU training...")
+    xgb_model = xgb.XGBClassifier(eval_metric='mlogloss', random_state=42, tree_method='hist')
+    xgb_model.fit(X_train, y_train)
+    print("XGBoost CPU training completed.")
+
+xgb_param_grid = {
+    'n_estimators': [250, 350, 500, 550],
+    'max_depth': [5, 20, 40, 60],
+    'learning_rate': [0.05, 0.1, 0.15]
+}
+try:
+    grid_search = GridSearchCV(estimator=xgb_model, param_grid=xgb_param_grid, cv=3, scoring='roc_auc', n_jobs=1, verbose=2)
+    grid_search.fit(X_train, y_train)
+    print("Hyperparameter tuning completed.")
+    best_xgb_model = grid_search.best_estimator_
+    print("Best XGBoost parameters found:", grid_search.best_params_)
+except Exception as e:
+    print("Hyperparameter tuning failed. Error:", e)
+    best_xgb_model = xgb_model
+
+# Output XGBoost Grid Search Results
+results = grid_search.cv_results_
+for mean_score, params in zip(results['mean_test_score'], results['params']):
+    print(f"ROC AUC Score: {mean_score:.4f}, Parameters: {params}")
+
+# Save the best XGBoost model
+with open(f'best_models/best_xgb_{hm}_{version}_{data_model}_{mer}.pkl', 'wb') as f:
+    pickle.dump(best_xgb_model, f)
+
+# Model Evaluation
+def evaluate_model(model, X_val, y_val, X_test, y_test):
+    print("\nEvaluating model...")
+    print("Validation Set Evaluation:")
+    y_val_pred = model.predict(X_val)
+    print(classification_report(y_val, y_val_pred))
+    print("Validation AUC-ROC:", roc_auc_score(y_val, model.predict_proba(X_val)[:, 1]))
+
+    print("\nTest Set Evaluation:")
+    y_test_pred = model.predict(X_test)
+    print(classification_report(y_test, y_test_pred))
+    print("Test AUC-ROC:", roc_auc_score(y_test, model.predict_proba(X_test)[:, 1]))
+
+# Evaluate Random Forest
+print("\nEvaluating Random Forest...")
+evaluate_model(best_rf_model, X_val, y_val, X_test, y_test)
+
+# Evaluate Gradient Boosting
+print("\nEvaluating Gradient Boosting...")
+evaluate_model(best_gb_model, X_val, y_val, X_test, y_test)
+
+# Evaluate Best XGBoost Model
+print("\nEvaluating Best XGBoost Model...")
+evaluate_model(best_xgb_model, X_val, y_val, X_test, y_test)
+
